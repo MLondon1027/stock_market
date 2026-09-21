@@ -39,6 +39,7 @@ def momentum_weights(
     top_n: int,
     lookback_months: int = 12,
     skip_months: int = 1,
+    eligibility: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Create month-end equal weights using only information then available.
 
@@ -52,6 +53,12 @@ def momentum_weights(
     denominator = month_end.shift(lookback_months)
     scores = numerator.div(denominator).sub(1)
 
+    if eligibility is not None:
+        eligible_at_formation = eligibility.reindex(
+            index=month_end.index, columns=month_end.columns, fill_value=False
+        ).fillna(False).astype(bool)
+        scores = scores.where(eligible_at_formation)
+
     weights = pd.DataFrame(0.0, index=month_end.index, columns=month_end.columns)
     for date, row in scores.iterrows():
         eligible = row.replace([np.inf, -np.inf], np.nan).dropna()
@@ -60,6 +67,44 @@ def momentum_weights(
         winners = eligible.nlargest(min(top_n, len(eligible))).index
         weights.loc[date, winners] = 1.0 / len(winners)
     return weights
+
+
+def point_in_time_membership_mask(
+    membership: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+    tickers: Iterable[str],
+) -> pd.DataFrame:
+    """Return whether each ticker was an index member on each supplied date.
+
+    Membership intervals use inclusive start dates and exclusive end dates.
+    Multiple intervals for the same ticker are supported.
+    """
+    required = {"ticker", "start_date", "end_date"}
+    missing = required.difference(membership.columns)
+    if missing:
+        raise ValueError(f"Membership data are missing columns: {sorted(missing)}")
+
+    index = pd.DatetimeIndex(pd.to_datetime(dates)).tz_localize(None)
+    columns = list(dict.fromkeys(tickers))
+    mask = pd.DataFrame(False, index=index, columns=columns, dtype=bool)
+    if mask.empty:
+        return mask
+
+    rows = membership.copy()
+    rows["start_date"] = pd.to_datetime(rows["start_date"], errors="coerce")
+    rows["end_date"] = pd.to_datetime(rows["end_date"], errors="coerce")
+    rows = rows.dropna(subset=["ticker", "start_date"])
+
+    available = set(columns)
+    for row in rows.itertuples(index=False):
+        ticker = str(row.ticker)
+        if ticker not in available:
+            continue
+        active = index >= row.start_date
+        if pd.notna(row.end_date):
+            active &= index < row.end_date
+        mask.loc[active, ticker] = True
+    return mask
 
 
 def _daily_weights(monthly_weights: pd.DataFrame, trading_index: pd.DatetimeIndex) -> pd.DataFrame:
@@ -101,9 +146,12 @@ def run_momentum_strategy(
     lookback_months: int,
     skip_months: int,
     transaction_cost_bps: float,
+    eligibility: pd.DataFrame | None = None,
 ) -> tuple[pd.Series, pd.Series, pd.DataFrame, int]:
     asset_prices = _clean_prices(asset_prices)
-    weights = momentum_weights(asset_prices, top_n, lookback_months, skip_months)
+    weights = momentum_weights(
+        asset_prices, top_n, lookback_months, skip_months, eligibility
+    )
     strategy, daily_weights, count = portfolio_returns_from_weights(
         asset_prices, weights, transaction_cost_bps
     )

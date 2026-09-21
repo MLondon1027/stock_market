@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
+import time
 
 import pandas as pd
 import plotly.express as px
@@ -10,6 +12,7 @@ import yfinance as yf
 from strategy_engine import (
     available_assets,
     calculate_download_start,
+    point_in_time_membership_mask,
     run_momentum_strategy,
     run_trend_strategy,
     summarize_backtest,
@@ -30,35 +33,49 @@ SECTORS = {
     "XLY": "Consumer Discretionary",
 }
 
-# A liquid current large-cap research universe. It is intentionally explicit so
-# the result is reproducible. It is not a point-in-time historical index roster.
-LARGE_CAP_STOCKS = [
-    "AAPL", "ABBV", "ABT", "ACN", "ADBE", "ADP", "AMAT", "AMD", "AMGN",
-    "AMZN", "AVGO", "AXP", "BAC", "BKNG", "BLK", "BMY", "BRK-B", "C",
-    "CAT", "CB", "CI", "CL", "CMCSA", "COP", "COST", "CRM", "CSCO",
-    "CVS", "CVX", "DE", "DHR", "DIS", "DUK", "ELV", "EMR", "EOG",
-    "ETN", "FDX", "GD", "GE", "GILD", "GM", "GOOGL", "GS", "HD", "HON",
-    "IBM", "INTC", "INTU", "ISRG", "JNJ", "JPM", "KO", "LIN", "LLY",
-    "LMT", "LOW", "MA", "MCD", "MDLZ", "META", "MMM", "MO", "MRK",
-    "MS", "MSFT", "NEE", "NFLX", "NKE", "NOW", "NVDA", "ORCL", "PEP",
-    "PFE", "PG", "PM", "QCOM", "RTX", "SBUX", "SCHW", "SO", "SPGI",
-    "SYK", "T", "TGT", "TMO", "TMUS", "TSLA", "TXN", "UNH", "UNP",
-    "UPS", "USB", "V", "VZ", "WFC", "WMT", "XOM",
-]
+MEMBERSHIP_FILE = Path(__file__).with_name("sp500_membership_intervals.csv")
+MEMBERSHIP_DATA_AS_OF = date(2026, 8, 18)
+
+
+@st.cache_data(show_spinner=False)
+def load_sp500_membership() -> pd.DataFrame:
+    membership = pd.read_csv(MEMBERSHIP_FILE)
+    membership["start_date"] = pd.to_datetime(membership["start_date"], errors="coerce")
+    membership["end_date"] = pd.to_datetime(membership["end_date"], errors="coerce")
+    membership = membership.dropna(subset=["ticker", "start_date"])
+    # Yahoo uses dashes for share classes while the membership source uses dots.
+    membership["ticker"] = membership["ticker"].str.replace(".", "-", regex=False)
+    return membership.sort_values(["start_date", "ticker"]).reset_index(drop=True)
+
+
+def relevant_member_tickers(
+    membership: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp
+) -> list[str]:
+    overlaps = membership["start_date"].le(end) & (
+        membership["end_date"].isna() | membership["end_date"].gt(start)
+    )
+    return sorted(membership.loc[overlaps, "ticker"].unique())
 
 
 @st.cache_data(ttl=21_600, show_spinner=False)
 def download_prices(tickers: tuple[str, ...], start: date, end: date) -> pd.DataFrame:
-    data = yf.download(
-        list(tickers),
-        start=pd.Timestamp(start).strftime("%Y-%m-%d"),
-        end=(pd.Timestamp(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-        group_by="column",
-        timeout=30,
-    )
+    data = pd.DataFrame()
+    for attempt in range(2):
+        data = yf.download(
+            list(tickers),
+            start=pd.Timestamp(start).strftime("%Y-%m-%d"),
+            end=(pd.Timestamp(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+            auto_adjust=True,
+            progress=False,
+            threads=8,
+            group_by="column",
+            timeout=30,
+        )
+        if not data.empty:
+            break
+        if attempt == 0:
+            time.sleep(3)
+
     if data.empty:
         raise ValueError("The market-data provider returned no prices. Retry in a minute.")
     if isinstance(data.columns, pd.MultiIndex):
@@ -177,12 +194,23 @@ with st.sidebar:
         "Strategy",
         [
             "Sector momentum",
-            "Large-cap stock momentum",
+            "Point-in-time S&P 500 momentum",
             "SPY 200-day trend",
         ],
     )
-    start_date = st.date_input("Start date", value=date(2010, 1, 1), min_value=date(2003, 1, 1), max_value=date.today())
-    end_date = st.date_input("End date", value=date.today(), min_value=date(2003, 1, 2), max_value=date.today())
+    maximum_end_date = (
+        MEMBERSHIP_DATA_AS_OF
+        if strategy_name == "Point-in-time S&P 500 momentum"
+        else date.today()
+    )
+    start_date = st.date_input(
+        "Start date", value=date(2010, 1, 1), min_value=date(2003, 1, 1),
+        max_value=maximum_end_date, key=f"start_date_{strategy_name}",
+    )
+    end_date = st.date_input(
+        "End date", value=maximum_end_date, min_value=date(2003, 1, 2),
+        max_value=maximum_end_date, key=f"end_date_{strategy_name}",
+    )
     starting_capital = st.number_input("Starting investment", min_value=100.0, value=10_000.0, step=1_000.0)
     transaction_cost_bps = st.number_input(
         "Cost per one-way trade (basis points)", min_value=0.0, max_value=100.0, value=5.0, step=1.0,
@@ -210,6 +238,7 @@ if run:
         st.error("The start date must be before the end date.")
         st.stop()
 
+    price_coverage_note: str | None = None
     try:
         with st.spinner("Downloading prices and running the strategy…"):
             requested_start = pd.Timestamp(start_date)
@@ -228,15 +257,40 @@ if run:
                     requested_start, requested_end, count, SECTORS,
                 )
 
-            elif strategy_name == "Large-cap stock momentum":
+            elif strategy_name == "Point-in-time S&P 500 momentum":
+                if end_date > MEMBERSHIP_DATA_AS_OF:
+                    raise ValueError(
+                        f"Historical S&P membership is verified only through "
+                        f"{MEMBERSHIP_DATA_AS_OF:%B %d, %Y}. Choose an earlier end date."
+                    )
                 download_start = calculate_download_start(requested_start, lookback_months)
-                tickers = tuple(LARGE_CAP_STOCKS + ["SPY"])
+                membership = load_sp500_membership()
+                member_tickers = relevant_member_tickers(
+                    membership, download_start, requested_end
+                )
+                tickers = tuple(member_tickers + ["SPY"])
                 prices = download_prices(tickers, download_start.date(), end_date)
                 assets = [ticker for ticker in available_assets(prices.drop(columns=["SPY"], errors="ignore"), 120)]
                 if len(assets) < top_n:
                     raise ValueError(f"Only {len(assets)} stocks had usable data; reduce the number of holdings or retry.")
+                formation_dates = prices[assets].resample("ME").last().index
+                eligibility = point_in_time_membership_mask(
+                    membership, formation_dates, assets
+                )
+                full_eligibility = point_in_time_membership_mask(
+                    membership, formation_dates, member_tickers
+                )
+                expected_members = full_eligibility.sum(axis=1).replace(0, pd.NA)
+                covered_members = eligibility.sum(axis=1)
+                coverage = covered_members.div(expected_members).dropna()
+                if not coverage.empty:
+                    price_coverage_note = (
+                        f"Yahoo usable-symbol coverage across monthly S&P rosters: "
+                        f"median {coverage.median():.1%}; minimum {coverage.min():.1%}."
+                    )
                 strategy, benchmark, weights, count = run_momentum_strategy(
-                    prices[assets], prices["SPY"], top_n, lookback_months, skip_months, transaction_cost_bps
+                    prices[assets], prices["SPY"], top_n, lookback_months,
+                    skip_months, transaction_cost_bps, eligibility,
                 )
                 result = summarize_backtest(
                     strategy_name, strategy, benchmark, weights, starting_capital,
@@ -257,11 +311,14 @@ if run:
 
         display_result(result)
 
-        if strategy_name == "Large-cap stock momentum":
-            st.warning(
-                "Stock-universe limitation: this version uses a fixed list of current large-cap companies. "
-                "It therefore has survivorship bias and should not be treated as a historically investable S&P 500 test."
+        if strategy_name == "Point-in-time S&P 500 momentum":
+            st.caption(
+                "Eligibility uses the S&P 500 membership in effect at each month-end. "
+                "Tesla, for example, cannot be selected before December 2020. Yahoo may omit "
+                "some discontinued historical symbols; these omissions are disclosed in the README."
             )
+            if price_coverage_note:
+                st.caption(price_coverage_note)
         elif strategy_name == "Sector momentum":
             st.caption("Sector test uses the nine original Select Sector SPDR ETFs to preserve a long common history.")
 
@@ -273,7 +330,7 @@ else:
     st.markdown(
         """
         - **Sector momentum:** each month, holds the strongest sector ETFs based on prior performance.
-        - **Large-cap stock momentum:** each month, holds the strongest stocks in the app's fixed liquid-stock universe.
+        - **Point-in-time S&P 500 momentum:** each month, ranks only the companies that belonged to the S&P 500 then.
         - **SPY trend:** holds SPY above its moving average and short-term Treasury bonds otherwise.
 
         The app delays every signal before applying the next return, includes trading costs, and uses adjusted prices.
