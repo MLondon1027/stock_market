@@ -42,6 +42,10 @@ def test_momentum_and_summary_run():
     assert result.metrics.loc["Strategy", "Ending Value"] > 0
     assert result.equity.index.is_monotonic_increasing
     assert count > 0
+    assert not result.holdings_history.empty
+    assert set(result.holdings_history.columns) == {"Month", "Ticker", "Name", "Weight", "Status"}
+    monthly_weight = result.holdings_history.groupby("Month")["Weight"].sum()
+    assert np.allclose(monthly_weight, 1.0)
 
 
 def test_trend_strategy_weights_sum_to_one():
@@ -52,4 +56,3 @@ def test_trend_strategy_weights_sum_to_one():
     assert np.allclose(weights.sum(axis=1), 1.0)
     assert strategy.index.equals(benchmark.index)
     assert count > 0
-

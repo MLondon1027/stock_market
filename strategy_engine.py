@@ -21,6 +21,7 @@ class BacktestResult:
     annual_returns: pd.DataFrame
     rolling_results: pd.DataFrame
     current_holdings: pd.DataFrame
+    holdings_history: pd.DataFrame
     rebalance_count: int
 
 
@@ -235,6 +236,27 @@ def summarize_backtest(
         holdings["Name"] = holdings["Ticker"].map(ticker_names).fillna(holdings["Ticker"])
         holdings = holdings[["Ticker", "Name", "Weight"]]
 
+    monthly_weights = period_weights.resample("ME").last()
+    history_rows: list[dict[str, object]] = []
+    previous_tickers: set[str] = set()
+    for month, row in monthly_weights.iterrows():
+        selected = row[row > 1e-8].sort_values(ascending=False)
+        current_tickers = set(selected.index)
+        for ticker, weight in selected.items():
+            history_rows.append(
+                {
+                    "Month": month.to_period("M").to_timestamp(),
+                    "Ticker": ticker,
+                    "Name": ticker_names.get(ticker, ticker) if ticker_names else ticker,
+                    "Weight": float(weight),
+                    "Status": "Retained" if ticker in previous_tickers else "Added",
+                }
+            )
+        previous_tickers = current_tickers
+    holdings_history = pd.DataFrame(
+        history_rows, columns=["Month", "Ticker", "Name", "Weight", "Status"]
+    )
+
     return BacktestResult(
         name=name,
         strategy_returns=combined.iloc[:, 0],
@@ -245,6 +267,7 @@ def summarize_backtest(
         annual_returns=annual,
         rolling_results=rolling,
         current_holdings=holdings,
+        holdings_history=holdings_history,
         rebalance_count=period_rebalance_count,
     )
 

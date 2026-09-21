@@ -8,7 +8,7 @@ A Streamlit backtesting app that compares rules-based strategies with investing 
 2. **Large-cap stock momentum** — ranks a fixed liquid large-cap stock universe and holds the strongest group, equal-weighted.
 3. **SPY moving-average trend** — holds SPY when it is above its moving average and SHY otherwise.
 
-Momentum defaults to the return from 12 months ago through one month ago. Signals are delayed before the next return is applied. The app supports transaction costs and displays growth, drawdowns, performance metrics, calendar returns, rolling outperformance, and ending holdings.
+Momentum defaults to the return from 12 months ago through one month ago. Signals are delayed before the next return is applied. The app supports transaction costs and displays growth, drawdowns, performance metrics, calendar returns, rolling outperformance, ending holdings, and the exact holdings for every month. The full monthly holdings history can be downloaded as a CSV.
 
 ## Deploy on Streamlit Community Cloud
 
@@ -43,4 +43,3 @@ streamlit run app.py
 - The trading-cost input is applied to one-way turnover. Selling one complete portfolio and buying another generates approximately 200% turnover.
 - The Sharpe ratio uses a zero-percent risk-free rate.
 - Past performance does not predict future performance.
-
